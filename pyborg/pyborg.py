@@ -1,0 +1,625 @@
+#
+# PyBorg: The python AI bot.
+#
+# Copyright (c) 2000, 2001 Tom Morton
+#
+# This bot was inspired by the PerlBorg, by Eric Bock.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#        
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+#
+# Tom Morton <tom@moretom.net>
+#
+
+from whrandom import *
+#from random import *
+import string
+import sys
+import os
+import marshal	# buffered marshal is bloody fast. wish i'd found this before :)
+import struct
+import time
+import cfgfile
+
+# Use context data a maximum of how many words deep?
+max_context_depth = 3
+# Minimum context depth
+min_context_depth = 1
+
+def filter_message(message):
+	"""
+	Filter a message body so it is suitable for learning from and
+	replying to. This involves removing confusing characters,
+	padding ? and ! with ". " so they also terminate lines
+	and converting to lower case.
+	"""
+	# to lowercase
+	message = string.lower(message)
+
+	# remove garbage
+	message = string.replace(message, "\"", "") # remove "s
+	message = string.replace(message, "\n", " ") # remove newlines
+	message = string.replace(message, "\r", " ") # remove carriage returns
+
+	# remove matching brackets (unmatched ones are likely smileys :-) *cough*
+	# should except out when not found.
+	index = 0
+	try:
+		while 1:
+			index = string.index(message, "(", index)
+			# Remove matching ) bracket
+			i = string.index(message, ")", index+1)
+			message = message[0:i]+message[i+1:]
+			# And remove the (
+			message = message[0:index]+message[index+1:]
+	except ValueError, e:
+		pass
+
+	# Find ! and ? and append full stops.
+	message = string.replace(message, "? ", "?. ")
+	message = string.replace(message, "! ", "!. ")
+
+	return message
+
+
+class pyborg:
+	ver_string = "I am a version 1.0.6 PyBorg, by Tom Morton."
+
+	# Main command list
+	commandlist = "Pyborg commands:\n!checkdict, !contexts, !help, !known, !learning, !rebuilddict, \
+!replace, !unlearn, !version, !words"
+	commanddict = {
+		"help": "Owner command. Usage: !help [command]\nPrints information about using a command, or a list of commands if no command is given",
+		"version": "Usage: !version\nDisplay what version of Pyborg we are running",
+		"words": "Usage: !words\nDisplay how many words are known",
+		"known": "Usage: !known word1 [word2 [...]]\nDisplays if one or more words are known, and how many contexts are known",
+		"contexts": "Owner command. Usage: !contexts <phrase>\nPrint contexts containing <phrase>",
+		"unlearn": "Owner command. Usage: !unlearn <phrase>\nRemove all occurances of a word or phrase from the dictionary. For example '!unlearn of of' would remove all contexts containing double 'of's",
+		"replace": "Owner command. Usage: !replace <old> <new>\nReplace all occurances of word <old> in the dictionary with <new>",
+		"learning": "Owner command. Usage: !learning [on|off]\nToggle bot learning. Without arguments shows the current setting",
+		"checkdict": "Owner command. Usage: !checkdict\nChecks the dictionary for broken links. Shouldn't happen, but worth trying if you get KeyError crashes",
+		"rebuilddict": "Owner command. Usage: !rebuilddict\nRebuilds dictionary links from the lines of known text. Takes a while. You probably don't need to do it unless your dictionary is very screwed"
+	}
+
+	def __init__(self):
+		"""
+		Open the dictionary. Resize as required.
+		"""
+		# pike i had old dicts ..
+		# marshal.version=0
+		
+		# Attempt to load settings
+		self.settings = cfgfile.cfgset()
+		self.settings.load("pyborg.cfg",
+			{ "num_contexts": ("Total word contexts", 0),
+			  "num_words": ("Total unique words known", 0),
+			  "learning": ("Allow the bot to learn", 1)
+			} )
+
+		# Read the dictionary
+		print "Reading dictionary..."
+		try:
+			f = open("words.dat", "rb")
+			s = f.read()
+			f.close()
+			self.words = marshal.loads(s)
+			del s
+			f = open("lines.dat", "rb")
+			s = f.read()
+			f.close()
+			self.lines = marshal.loads(s)
+			del s
+		except (EOFError, IOError), e:
+			# The datafiles are missing or corrupt. First try the
+			# backups. Failing that start new database.
+			print "Error reading dictionary. Trying backups..."
+			try:
+				f = open("words.bak", "rb")
+				s = f.read()
+				f.close()
+				self.words = marshal.loads(s)
+				del s
+				f = open("lines.bak", "rb")
+				s = f.read()
+				f.close()
+				self.lines = marshal.loads(s)
+				del s
+				os.rename("words.bak", "words.dat")
+				os.rename("lines.bak", "lines.dat")
+			except (EOFError, IOError), e:
+				# Create mew database
+				self.words = {}
+				self.lines = {}
+				print "Error reading backups. New database created."
+	
+		# Is a resizing required?
+		if len(self.words) != self.settings.num_words:
+			print "Updating dictionary information..."
+			self.settings.num_words = len(self.words)
+			num_contexts = 0
+			# Get number of contexts
+			for x in self.lines.keys():
+				num_contexts = num_contexts + len(string.split(self.lines[x]))
+			self.settings.num_contexts = num_contexts
+			# Save new values
+			self.settings.save()
+
+	def save_all(self):
+		print "Writing dictionary..."
+		# backup old database if present
+		try:
+			os.rename("words.dat", "words.bak")
+			os.rename("lines.dat", "lines.bak")
+		except OSError, e:
+			pass
+		f = open("words.dat", "wb")
+		s = marshal.dumps(self.words)
+		f.write(s)
+		f.close()
+		f = open("lines.dat", "wb")
+		s = marshal.dumps(self.lines)
+		f.write(s)
+		f.close()
+		# Save settings
+		self.settings.save()
+
+	def process_msg(self, io_module, body, replyrate, learn, args, owner=0):
+		"""
+		Process message 'body' and pass back to IO module with args.
+		If owner==1 allow owner commands.
+		"""
+		# add trailing space so sentences are broken up correctly
+		body = body + " "
+
+		# Parse commands
+		if body[0] == "!":
+			self.do_commands(io_module, body, args, owner)
+			return
+
+		# Filter out garbage and do some formatting
+		body = filter_message(body)
+	
+		# Learn from input
+		if self.settings.learning == 1 and learn == 1:
+			self.learn(body)
+	
+		# Make a reply if desired
+		if randint(0, 99) < replyrate:
+			message = self.reply(body)
+			# single word reply: always output
+			if len(string.split(message)) == 1:
+				io_module.output(message, args)
+				return
+			# empty. do not output
+			if message == "":
+				return
+			# same as input. do not output
+			if message == string.lower(string.strip(body)):
+				return
+			# else output
+			io_module.output(message, args)
+	
+	def do_commands(self, io_module, body, args, owner):
+		"""
+		Respond to user comands.
+		"""
+		msg = ""
+	
+		command_list = string.split(body)
+		command_list[0] = string.lower(command_list[0])
+
+		# Guest commands.
+	
+		# Version string
+		if command_list[0] == "!version":
+			msg = self.ver_string
+		# How many words do we know?
+		elif command_list[0] == "!words":
+			num_w = self.settings.num_words
+			num_c = self.settings.num_contexts
+			num_l = len(self.lines)
+			if num_w != 0:
+				num_cpw = num_c/float(num_w) # contexts per word
+			else:
+				num_cpw = 0.0
+			msg = "I know "+str(num_w)+" words ("+str(num_c)+" contexts, %.2f" % num_cpw+" per word), "+str(num_l)+" lines."
+				
+		# Do i know this word
+		elif command_list[0] == "!known":
+			if len(command_list) == 2:
+				# single word specified
+				word = string.lower(command_list[1])
+				if self.words.has_key(word):
+					c = len(self.words[word])
+					msg = word+" is known ("+`c`+" contexts)"
+				else:
+					msg = word+" is unknown."
+			elif len(command_list) > 2:
+				# multiple words.
+				words = []
+				for x in command_list[1:]:
+					words.append(string.lower(x))
+				msg = "Number of contexts: "
+				for x in words:
+					if self.words.has_key(x):
+						c = len(self.words[x])
+						msg = msg+x+"/"+str(c)+" "
+					else:
+						msg = msg+x+"/0 "
+	
+		# Owner commands
+		if owner == 1:
+			# Save dictionary
+			if command_list[0] == "!save":
+				self.save_all()
+				msg = "Dictionary saved"
+			# Command list
+			if command_list[0] == "!help":
+				if len(command_list) > 1:
+					# Help for a specific command
+					cmd = string.lower(command_list[1])
+					dic = None
+					if cmd in self.commanddict.keys():
+						dic = self.commanddict
+					elif cmd in io_module.commanddict.keys():
+						dic = io_module.commanddict
+					if dic:
+						for i in string.split(dic[cmd], "\n"):
+							io_module.output(i, args)
+					else:
+						msg = "No help on command '%s'" % cmd
+				else:
+					for i in string.split(self.commandlist, "\n"):
+						io_module.output(i, args)
+					for i in string.split(io_module.commandlist, "\n"):
+						io_module.output(i, args)
+			# Check for broken links in the dictionary
+			elif command_list[0] == "!checkdict":
+				t = time.time()
+				num_broken = 0
+				num_bad = 0
+				for w in self.words.keys():
+					wlist = self.words[w]
+
+					for i in xrange(len(wlist)-1, -1, -1):
+						line_idx, word_num = struct.unpack("iH", wlist[i])
+
+						# Nasty critical error we should fix
+						if not self.lines.has_key(line_idx):
+							print "Removing broken link '%s' -> %d" % (w, line_idx)
+							num_broken = num_broken + 1
+							del wlist[i]
+						else:
+							# Check pointed to word is correct
+							split_line = string.split(self.lines[line_idx])
+							if split_line[word_num] != w:
+								print "Line '%s' word %d is not '%s' as expected." % (self.lines[line_idx], word_num, w)
+								num_bad = num_bad + 1
+								del wlist[i]
+					if len(wlist) == 0:
+						del self.words[w]
+						self.settings.num_words = self.settings.num_words - 1
+						print "\""+w+"\" vaped totally"
+
+				msg = "Checked dictionary in %0.2fs. Fixed links: %d broken, %d bad." % (time.time()-t, num_broken, num_bad)
+			# Rebuild the dictionary by discarding the word links and
+			# re-parsing each line
+			elif command_list[0] == "!rebuilddict":
+				t = time.time()
+				old_lines = self.lines
+				old_num_words = self.settings.num_words
+				old_num_contexts = self.settings.num_contexts
+				
+				self.words = {}
+				self.lines = {}
+				self.settings.num_words = 0
+				self.settings.num_contexts = 0
+
+				for k in old_lines.keys():
+					self.learn(old_lines[k])
+
+				msg = "Rebuilt dictionary in %0.2fs. Words %d (%+d), contexts %d (%+d)" % \
+						(time.time()-t,
+						old_num_words,
+						self.settings.num_words - old_num_words,
+						old_num_contexts,
+						self.settings.num_contexts - old_num_contexts)
+				
+			# Change a typo in the dictionary
+			elif command_list[0] == "!replace":
+				if len(command_list) < 3:
+					return
+				old = string.lower(command_list[1])
+				new = string.lower(command_list[2])
+				msg = self.replace(old, new)
+
+			# Print contexts [flooding...:-]
+			elif command_list[0] == "!contexts":
+				# This is a large lump of data and should
+				# probably be printed, not module.output XXX
+
+				# build context we are looking for
+				context = string.join(command_list[1:], " ")
+				context = string.lower(context)
+				if context == "":
+					return
+				io_module.output("Contexts containing \""+context+"\":", args)
+				# Build context list
+				# Pad it
+				context = " "+context+" "
+				c = []
+				# Search through contexts
+				for x in self.lines.keys():
+					# get context
+					ctxt = self.lines[x]
+					# add leading whitespace for easy sloppy search code
+					ctxt = " "+ctxt+" "
+					if string.find(ctxt, context) != -1:
+						# Avoid duplicates (2 of a word
+						# in a single context)
+						if len(c) == 0:
+							c.append(self.lines[x])
+						elif c[len(c)-1] != self.lines[x]:
+							c.append(self.lines[x])
+				x = 0
+				while x < 5:
+					if x < len(c):
+						io_module.output(c[x], args)
+					x = x + 1
+				if len(c) == 5:
+					return
+				if len(c) > 10:
+					io_module.output("...("+`len(c)-10`+" skipped)...", args)
+				x = len(c) - 5
+				if x < 5:
+					x = 5
+				while x < len(c):
+					io_module.output(c[x], args)
+					x = x + 1
+			# Remove a word from the vocabulary [use with care]
+			elif command_list[0] == "!unlearn":
+				# build context we are looking for
+				context = string.join(command_list[1:], " ")
+				context = string.lower(context)
+				if context == "":
+					return
+				print "Looking for: "+context
+				# Unlearn contexts containing 'context'
+				t = time.time()
+				self.unlearn(context)
+				# we don't actually check if anything was
+				# done..
+				msg = "Unlearn done in %0.2fs" % (time.time()-t)
+
+			# Query/toggle bot learning
+			elif command_list[0] == "!learning":
+				msg = "Learning mode "
+				if len(command_list) == 1:
+					if self.settings.learning == 0:
+						msg = msg + "off"
+					else:
+						msg = msg + "on"
+				else:
+					toggle = string.lower(command_list[1])
+					if toggle == "on":
+						msg = msg + "on"
+						self.settings.learning = 1
+					else:
+						msg = msg + "off"
+						self.settings.learning = 0
+			# Quit
+			elif command_list[0] == "!quit":
+				# Close the dictionary
+				self.save_all()
+				sys.exit()
+				
+			# Save changes
+			self.settings.save()
+	
+		if msg != "":	
+			io_module.output(msg, args)
+
+	def replace(self, old, new):
+		"""
+		Replace all occuraces of 'old' in the dictionary with
+		'new'. Nice for fixing learnt typos.
+		"""
+		try:
+			pointers = self.words[old]
+		except KeyError, e:
+			return old+" not known."
+		changed = 0
+
+		for x in pointers:
+			# pointers consist of (line, word) to self.lines
+			l, w = struct.unpack("iH", x)
+			line = string.split(self.lines[l])
+			if line[w] != old:
+				# fucked dictionary
+				print "Broken link: "+str(x)+" "+self.lines[l]
+				continue
+			else:
+				line[w] = new
+				self.lines[l] = string.join(line, " ")
+				changed = changed + 1
+
+		if self.words.has_key(new):
+			self.settings.num_words = self.settings.num_words - 1
+			self.words[new].extend(self.words[old])
+		else:
+			self.words[new] = self.words[old]
+		del self.words[old]
+		return `changed`+" instances of "+old+" replaced with "+new
+
+	def unlearn(self, context):
+		"""
+		Unlearn all contexts containing 'context'. If 'context'
+		is a single word then all contexts containing that word
+		will be removed, just like the old !unlearn <word>
+		"""
+		# Pad thing to look for
+		# We pad so we don't match 'shit' when searching for 'hit', etc.
+		context = " "+context+" "
+		# Search through contexts
+		# count deleted items
+		dellist = []
+		# words that will have broken context due to this
+		wordlist = []
+		for x in self.lines.keys():
+			# get context. pad
+			c = " "+self.lines[x]+" "
+			if string.find(c, context) != -1:
+				# Split line up
+				wlist = string.split(self.lines[x])
+				# add touched words to list
+				for w in wlist:
+					if not w in wordlist:
+						wordlist.append(w)
+				dellist.append(x)
+				del self.lines[x]
+		words = self.words
+		unpack = struct.unpack
+		# update links
+		for x in wordlist:
+			word_contexts = words[x]
+			# Check all the word's links (backwards so we can delete)
+			for y in xrange(len(word_contexts)-1, -1, -1):
+				# Check for any of the deleted contexts
+				if unpack("iH", word_contexts[y])[0] in dellist:
+					del word_contexts[y]
+					self.settings.num_contexts = self.settings.num_contexts - 1
+			if len(words[x]) == 0:
+				del words[x]
+				self.settings.num_words = self.settings.num_words - 1
+				print "\""+x+"\" vaped totally"
+
+	def reply(self, body):
+		"""
+		Reply to a line of text.
+		"""
+		# split sentences into list of words
+		_words = string.split(body, ". ")
+		words = []
+		for i in _words:
+			words = words + string.split(i)
+		del _words
+
+		if len(words) == 0:
+			return ""
+
+		# Find rarest word (excluding those unknown)
+		index = []
+		known = -1
+		for x in range(0, len(words)):
+			if self.words.has_key(words[x]):
+				k = len(self.words[words[x]])
+			else:
+				continue
+			if known == -1 or k < known:
+				index = [words[x]]
+				known = k
+				continue
+			elif k == known:
+				index.append(words[x])
+				continue
+		# Index now contains list of rarest known words in sentence
+		if len(index)==0:
+			return ""
+		x = randint(0, len(index)-1)
+		word = index[x]
+
+		# Build sentence backwards from "chosen" word
+		sentence = [word]
+		done = 0
+		while done == 0:
+			# get random context of first word
+			# l = line, w = word
+			c = len(self.words[sentence[0]])
+			l, w = struct.unpack("iH", self.words[sentence[0]][randint(0, c-1)])
+			context = self.lines[l]
+			cwords = string.split(context)
+			# How many words deep to use
+			depth = randint(min_context_depth, max_context_depth)
+			for x in range(1, depth+1):
+				if w - x < 0:
+					# at very start of context
+					done = 1
+					break
+				else:
+					sentence.insert(0, cwords[w-x])
+				if w - x == 0:
+					# We have just placed a word that was start
+					# of sentence. building backwards from this
+					# tends to lead to crappy sentences, so don't
+					done = 1
+					break
+
+		# Now build sentence forwards from "chosen" word
+		done = 0
+		while done == 0:
+			# get random context of last word
+			# l = line, w = word
+			c = len(self.words[sentence[len(sentence)-1]])
+			l, w = struct.unpack("iH", self.words[sentence[len(sentence)-1]][randint(0, c-1)])
+			context = self.lines[l]
+			cwords = string.split(context)
+			# How many words deep to use context
+			depth = randint(min_context_depth, max_context_depth)
+			for x in range(1, depth+1):
+				if w+x >= len(cwords):
+					# overshot end of context
+					done = 1
+					break
+				else:
+					sentence.append(cwords[w+x])
+		# Sentence is finished. build into a string
+		return string.join(sentence, " ")
+
+	def learn(self, body):
+		"""
+		Lines should be cleaned (filter_message()) before passing
+		to this.
+		"""
+		def learn_line(body, self):
+			"""
+			Learn from a sentence.
+			"""
+			words = string.split(body)
+			# Ignore sentences of < 1 words XXX was <3
+			if len(words) < 1:
+				return
+			cleanbody = string.join(words, " ")
+
+			hashval = hash(cleanbody)
+
+			# Check context isn't already known
+			# Hash collisions we don't care about. 2^32 is big :-)
+			if not self.lines.has_key(hashval):
+				
+				self.lines[hashval] = cleanbody
+				# Add link for each word
+				for x in range(0, len(words)):
+					if self.words.has_key(words[x]):
+						# Add entry. (line number, word number)
+						self.words[words[x]].append(struct.pack("iH", hashval, x))
+					else:
+						self.words[words[x]] = [ struct.pack("iH", hashval, x) ]
+						self.settings.num_words = self.settings.num_words + 1
+					self.settings.num_contexts = self.settings.num_contexts + 1
+		# Split body text into sentences and parse them
+		# one by one.
+		list = string.split(body, ". ")
+		for x in list:
+			learn_line(x, self)
+
